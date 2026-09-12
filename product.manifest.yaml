@@ -2,7 +2,7 @@ manifest_version: "1"
 id: ithute-tutor
 name: Ithute Tutor
 category: education
-source_path: products/ithute-tutor
+source_path: .
 public_url: https://tutor.ithute.co.ls
 services:
   auth: central
