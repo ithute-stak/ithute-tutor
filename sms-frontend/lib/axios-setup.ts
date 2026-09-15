@@ -18,8 +18,6 @@ interface TutorAxiosRequestConfig extends InternalAxiosRequestConfig {
     skipAuthRefresh?: boolean;
 }
 
-/* ---------------- TOKEN INJECTION ---------------- */
-
 let getToken: () => string | null = () => null;
 let setToken: (token: string | null) => void = () => {};
 
@@ -31,23 +29,17 @@ export const injectAuth = (opts: {
     setToken = opts.setToken;
 };
 
-/* ---------------- REQUEST INTERCEPTOR ---------------- */
-
 api.interceptors.request.use((config: InternalAxiosRequestConfig) => {
     const token = getToken();
-
     if (token) {
         config.headers = config.headers ?? {};
         config.headers.Authorization = `Bearer ${token}`;
     }
-
     return config;
 });
 
-/* ---------------- RESPONSE INTERCEPTOR ---------------- */
-
 // One shared refresh promise prevents refresh storms and guarantees that every
-// request waiting on a rotated token resolves or rejects together.
+// request waiting on a rotated Tutor token resolves or rejects together.
 let refreshPromise: Promise<string> | null = null;
 
 function refreshOnce(): Promise<string> {
@@ -59,8 +51,6 @@ function refreshOnce(): Promise<string> {
                 return token;
             })
             .catch((error) => {
-                // Only a definite expired/invalid session clears auth. A temporary
-                // central Auth outage must not silently log the user out.
                 if (axios.isAxiosError(error) && error.response?.status === 401) {
                     setToken(null);
                 }
@@ -96,8 +86,6 @@ api.interceptors.response.use(
             original.headers.Authorization = `Bearer ${newToken}`;
             return api(original);
         } catch (refreshError) {
-            // AuthProvider is the single owner of navigation. The HTTP layer never
-            // hard-redirects, avoiding competing login/session redirect loops.
             return Promise.reject(refreshError);
         }
     },

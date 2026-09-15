@@ -40,7 +40,6 @@ class UserUpdate(BaseModel):
 
 class UserRead(UserBase):
     id: UUID
-    auth_user_id: Optional[UUID] = None
     person: Optional[PersonRead] = None
 
     model_config = {"from_attributes": True}

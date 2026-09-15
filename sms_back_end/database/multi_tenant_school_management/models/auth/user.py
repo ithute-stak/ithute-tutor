@@ -10,19 +10,14 @@ from database.multi_tenant_school_management.schemas.user import UserRole
 class User(Base):
     __tablename__ = "users"
 
-    # Immutable cross-product identity from !thute Auth (OIDC/JWT sub).
-    # It is nullable during migration so existing Tutor users are never linked
-    # merely because an email/phone happens to match a central account.
-    auth_user_id = Column(UUID(as_uuid=True), unique=True, index=True, nullable=True)
-
     username = Column(String, nullable=False)
     email = Column(String, unique=True, index=True, nullable=False)
-    password = Column(String, nullable=True)  # legacy migration/linking credential only
+    password = Column(String, nullable=False)
     channel = Column(String(255))
     role = Column(Enum(UserRole), nullable=False, index=True)
 
-    # Transitional/default workspace only. New authorization uses
-    # SchoolMembership so one central person can belong to multiple schools.
+    # Default workspace. SchoolMembership allows one Tutor user to belong to
+    # multiple schools while the account itself remains owned only by Tutor.
     school_id = Column(UUID(as_uuid=True), ForeignKey("schools.id"), nullable=True)
 
     school = relationship("School", back_populates="users")

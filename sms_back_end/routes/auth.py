@@ -1,30 +1,19 @@
 from __future__ import annotations
 
-import base64
-import hashlib
-import secrets
 import uuid
-from urllib.parse import urlencode
+from datetime import datetime
 
-import httpx
-import jwt
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from fastapi.responses import JSONResponse, RedirectResponse
-from pydantic import BaseModel, EmailStr
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from database.config.config import settings
-from database.multi_tenant_school_management.models import SchoolMembership, User
+from database.multi_tenant_school_management.models import RefreshToken, SchoolMembership, User
 from database.multi_tenant_school_management.schemas.user import UserLogin, UserRead, UserUpdate
 from database.session import get_db
 from utils.auth.password_hash_verify import hash_password, verify_password
 from utils.auth.tokens import authenticate_user, get_current_user
-from utils.central_auth import (
-    CentralAuthError,
-    project_platform_owner,
-    require_central_claims,
-    validate_central_access_token,
-)
+from utils.decode_encode_token import create_refresh_token, decode_token
 from utils.school_context import (
     SCHOOL_WORKSPACE_COOKIE,
     SchoolContext,
@@ -36,46 +25,33 @@ from utils.school_context import (
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
 
-class LegacyLinkRequest(BaseModel):
-    email: EmailStr
-    password: str
-
-
-def _pkce_challenge(verifier: str) -> str:
-    digest = hashlib.sha256(verifier.encode("ascii")).digest()
-    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
-
-
 def _cookie_kwargs(max_age: int) -> dict[str, object]:
     return {
         "max_age": max_age,
         "httponly": True,
-        "secure": settings.AUTH_COOKIE_SECURE,
-        "samesite": settings.AUTH_COOKIE_SAMESITE,
+        "secure": settings.SESSION_COOKIE_SECURE,
+        "samesite": settings.SESSION_COOKIE_SAMESITE,
         "path": "/",
     }
 
 
 def _set_session_cookies(response, access_token: str, refresh_token: str) -> None:
     response.set_cookie(
-        settings.AUTH_ACCESS_COOKIE_NAME,
+        settings.ACCESS_COOKIE_NAME,
         access_token,
-        **_cookie_kwargs(60 * 15),
+        **_cookie_kwargs(settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60),
     )
     response.set_cookie(
-        settings.AUTH_REFRESH_COOKIE_NAME,
+        settings.REFRESH_COOKIE_NAME,
         refresh_token,
-        **_cookie_kwargs(settings.AUTH_COOKIE_MAX_AGE_SECONDS),
+        **_cookie_kwargs(settings.refresh_cookie_max_age_seconds),
     )
 
 
 def _clear_session_cookies(response) -> None:
     for name in (
-        settings.AUTH_ACCESS_COOKIE_NAME,
-        settings.AUTH_REFRESH_COOKIE_NAME,
-        settings.AUTH_OIDC_STATE_COOKIE_NAME,
-        settings.AUTH_OIDC_NONCE_COOKIE_NAME,
-        settings.AUTH_OIDC_VERIFIER_COOKIE_NAME,
+        settings.ACCESS_COOKIE_NAME,
+        settings.REFRESH_COOKIE_NAME,
         SCHOOL_WORKSPACE_COOKIE,
     ):
         response.delete_cookie(name, path="/")
@@ -103,6 +79,25 @@ def _role_value(user: User) -> str:
     return getattr(user.role, "value", str(user.role))
 
 
+def _user_payload(user: User) -> dict[str, object]:
+    return {
+        "id": str(user.id),
+        "channel": user.channel,
+        "email": user.email,
+        "name": user.username,
+        "role": _role_value(user),
+        "school_id": str(user.school_id) if user.school_id else None,
+    }
+
+
+def _login_payload(user: User, access_token: str) -> dict[str, object]:
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": _user_payload(user),
+    }
+
+
 def _membership_for_school(
     db: Session,
     user_id: uuid.UUID,
@@ -123,220 +118,92 @@ def _user_belongs_to_school(db: Session, user: User, school_id: uuid.UUID) -> bo
     return user.school_id == school_id or _membership_for_school(db, user.id, school_id) is not None
 
 
-@router.get("/oidc/login")
-def oidc_login() -> RedirectResponse:
-    verifier = secrets.token_urlsafe(64)[:96]
-    state_value = secrets.token_urlsafe(32)
-    nonce = secrets.token_urlsafe(32)
-    query = urlencode(
-        {
-            "response_type": "code",
-            "client_id": settings.AUTH_AUDIENCE,
-            "redirect_uri": settings.AUTH_OIDC_REDIRECT_URI,
-            "code_challenge": _pkce_challenge(verifier),
-            "code_challenge_method": "S256",
-            "scope": "openid profile email phone",
-            "state": state_value,
-            "nonce": nonce,
-        }
+def _issue_refresh_token(db: Session, user: User) -> str:
+    refresh_token, jti, expires_at = create_refresh_token({"user_id": str(user.id)})
+    db.add(
+        RefreshToken(
+            jti=jti,
+            user_id=user.id,
+            revoked=False,
+            expires_at=expires_at,
+        )
     )
-    response = RedirectResponse(f"{settings.auth_authorization_url}?{query}", status_code=303)
-    short_cookie = _cookie_kwargs(600)
-    response.set_cookie(settings.AUTH_OIDC_STATE_COOKIE_NAME, state_value, **short_cookie)
-    response.set_cookie(settings.AUTH_OIDC_NONCE_COOKIE_NAME, nonce, **short_cookie)
-    response.set_cookie(settings.AUTH_OIDC_VERIFIER_COOKIE_NAME, verifier, **short_cookie)
-    return _no_store(response)
+    return refresh_token
 
 
-@router.get("/oidc/callback")
-def oidc_callback(
-    request: Request,
-    code: str = Query(..., min_length=1),
-    state_value: str = Query(..., alias="state", min_length=1),
-    db: Session = Depends(get_db),
-):
-    expected_state = request.cookies.get(settings.AUTH_OIDC_STATE_COOKIE_NAME)
-    nonce = request.cookies.get(settings.AUTH_OIDC_NONCE_COOKIE_NAME)
-    verifier = request.cookies.get(settings.AUTH_OIDC_VERIFIER_COOKIE_NAME)
-    if not expected_state or not nonce or not verifier or not secrets.compare_digest(expected_state, state_value):
-        raise HTTPException(status_code=400, detail="invalid OIDC state")
-
-    try:
-        token_response = httpx.post(
-            settings.auth_token_url,
-            data={
-                "grant_type": "authorization_code",
-                "client_id": settings.AUTH_AUDIENCE,
-                "code": code,
-                "redirect_uri": settings.AUTH_OIDC_REDIRECT_URI,
-                "code_verifier": verifier,
-            },
-            timeout=10.0,
-        )
-        token_response.raise_for_status()
-        token_data = token_response.json()
-    except (httpx.HTTPError, ValueError) as exc:
-        raise HTTPException(status_code=502, detail="central Auth token exchange failed") from exc
-
-    access_token = str(token_data.get("access_token") or "")
-    refresh_token = str(token_data.get("refresh_token") or "")
-    id_token = str(token_data.get("id_token") or "")
-    if not access_token or not refresh_token or not id_token:
-        raise HTTPException(status_code=502, detail="central Auth returned an incomplete token response")
-
-    claims = validate_central_access_token(access_token)
-    try:
-        signing_key = jwt.PyJWKClient(settings.auth_jwks_url).get_signing_key_from_jwt(id_token).key
-        id_claims = jwt.decode(
-            id_token,
-            signing_key,
-            algorithms=["RS256"],
-            issuer=settings.auth_issuer,
-            audience=settings.AUTH_AUDIENCE,
-            options={"require": ["exp", "iss", "aud", "sub", "nonce"]},
-        )
-    except jwt.PyJWTError as exc:
-        raise HTTPException(status_code=401, detail="invalid central Auth ID token") from exc
-
-    if id_claims.get("nonce") != nonce or id_claims.get("sub") != claims.get("sub"):
-        raise HTTPException(status_code=401, detail="central Auth OIDC validation failed")
-
-    subject = uuid.UUID(str(claims["sub"]))
-    if claims.get("is_platform_admin") is True:
-        linked_user = project_platform_owner(db, claims)
-    else:
-        linked_user = db.query(User).filter(User.auth_user_id == subject).first()
-
-    if linked_user is None:
-        destination = "/login?link_required=1"
-    elif claims.get("is_platform_admin") is True:
-        destination = "/dashboard"
-    else:
-        has_membership = (
-            db.query(SchoolMembership)
-            .filter(
-                SchoolMembership.user_id == linked_user.id,
-                SchoolMembership.is_active.is_(True),
-            )
-            .first()
-            is not None
-        )
-        destination = "/dashboard" if has_membership or linked_user.school_id is not None else "/onboarding/school"
-
-    response = RedirectResponse(f"{settings.TUTOR_FRONTEND_URL.rstrip('/')}{destination}", status_code=303)
-    _set_session_cookies(response, access_token, refresh_token)
-    for name in (
-        settings.AUTH_OIDC_STATE_COOKIE_NAME,
-        settings.AUTH_OIDC_NONCE_COOKIE_NAME,
-        settings.AUTH_OIDC_VERIFIER_COOKIE_NAME,
-    ):
-        response.delete_cookie(name, path="/")
-    return _no_store(response)
-
-
-@router.post("/link-central")
-def link_existing_tutor_profile(
-    payload: LegacyLinkRequest,
-    request: Request,
-    db: Session = Depends(get_db),
-):
-    """Link only after proving control of both central and legacy identities."""
-    claims = require_central_claims(request)
-    subject = uuid.UUID(str(claims["sub"]))
-
-    existing_subject = db.query(User).filter(User.auth_user_id == subject).first()
-    if existing_subject is not None:
-        return {"linked": True, "user_id": str(existing_subject.id)}
-
-    user = db.query(User).filter(User.email == str(payload.email).strip().lower()).first()
+@router.post("/login")
+def login(payload: UserLogin, db: Session = Depends(get_db)):
+    email = str(payload.email).strip().lower()
+    user = db.query(User).filter(User.email == email).first()
     if user is None or not user.password or not verify_password(payload.password, str(user.password)):
-        raise HTTPException(status_code=401, detail="legacy Tutor credentials are invalid")
-    if user.auth_user_id is not None and user.auth_user_id != subject:
-        raise HTTPException(status_code=409, detail="Tutor profile is already linked to another !thute account")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
 
-    user.auth_user_id = subject
+    access_token = authenticate_user(user)
+    refresh_token = _issue_refresh_token(db, user)
     db.commit()
-    return {"linked": True, "user_id": str(user.id), "auth_user_id": str(subject)}
+
+    response = _auth_json(_login_payload(user, access_token))
+    _set_session_cookies(response, access_token, refresh_token)
+    return response
 
 
-@router.get("/me", response_model=UserRead)
+@router.get("/me")
 def me(current_user: User = Depends(get_current_user)):
-    return current_user
+    return _user_payload(current_user)
 
 
 @router.post("/refresh")
-def refresh(request: Request):
-    refresh_token = request.cookies.get(settings.AUTH_REFRESH_COOKIE_NAME)
+def refresh(request: Request, db: Session = Depends(get_db)):
+    refresh_token = request.cookies.get(settings.REFRESH_COOKIE_NAME)
     if not refresh_token:
-        # A missing/expired local refresh cookie is a definite ended session.
-        # Clear any stale access/workspace cookies so the browser cannot loop on
-        # the same invalid state during the next bootstrap.
         return _auth_json(
-            {"detail": "missing central refresh token"},
+            {"detail": "Tutor session has expired"},
             status_code=status.HTTP_401_UNAUTHORIZED,
             clear_session=True,
         )
 
     try:
-        auth_response = httpx.post(
-            settings.auth_refresh_url,
-            json={"client_id": settings.AUTH_AUDIENCE, "refresh_token": refresh_token},
-            timeout=10.0,
-        )
-    except httpx.RequestError:
-        # A central Auth/network outage is not proof that the user's refresh
-        # token expired. Preserve the session cookies and let the UI retry.
-        response = _auth_json(
-            {"detail": "central Auth is temporarily unavailable"},
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        )
-        response.headers["Retry-After"] = "5"
-        return response
-
-    if auth_response.status_code in (400, 401, 403):
+        claims = decode_token(refresh_token, expected_use="refresh")
+        user_id = uuid.UUID(str(claims.get("user_id")))
+        jti = str(claims.get("jti"))
+    except (HTTPException, TypeError, ValueError):
         return _auth_json(
-            {"detail": "central Auth session expired"},
+            {"detail": "Tutor session has expired"},
             status_code=status.HTTP_401_UNAUTHORIZED,
             clear_session=True,
         )
 
-    if auth_response.status_code >= 500:
-        response = _auth_json(
-            {"detail": "central Auth is temporarily unavailable"},
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+    stored = (
+        db.query(RefreshToken)
+        .filter(
+            RefreshToken.jti == jti,
+            RefreshToken.user_id == user_id,
+            RefreshToken.revoked.is_(False),
         )
-        response.headers["Retry-After"] = "5"
-        return response
-
-    if not 200 <= auth_response.status_code < 300:
+        .first()
+    )
+    if stored is None or stored.expires_at <= datetime.utcnow():
         return _auth_json(
-            {"detail": "central Auth refresh failed"},
-            status_code=status.HTTP_502_BAD_GATEWAY,
-        )
-
-    try:
-        token_data = auth_response.json()
-    except ValueError:
-        return _auth_json(
-            {"detail": "central Auth returned an invalid refresh response"},
-            status_code=status.HTTP_502_BAD_GATEWAY,
+            {"detail": "Tutor session has expired"},
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            clear_session=True,
         )
 
-    access_token = str(token_data.get("access_token") or "")
-    new_refresh = str(token_data.get("refresh_token") or "")
-    if not access_token or not new_refresh:
+    user = db.get(User, user_id)
+    if user is None:
+        stored.revoked = True
+        db.commit()
         return _auth_json(
-            {"detail": "central Auth refresh response incomplete"},
-            status_code=status.HTTP_502_BAD_GATEWAY,
+            {"detail": "Tutor user no longer exists"},
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            clear_session=True,
         )
 
-    try:
-        validate_central_access_token(access_token)
-    except CentralAuthError:
-        return _auth_json(
-            {"detail": "central Auth returned an invalid access token"},
-            status_code=status.HTTP_502_BAD_GATEWAY,
-        )
+    # Rotate refresh tokens on every use. A stolen old refresh token cannot be replayed.
+    stored.revoked = True
+    access_token = authenticate_user(user)
+    new_refresh = _issue_refresh_token(db, user)
+    db.commit()
 
     response = _auth_json({"access_token": access_token, "token_type": "bearer"})
     _set_session_cookies(response, access_token, new_refresh)
@@ -344,45 +211,22 @@ def refresh(request: Request):
 
 
 @router.post("/logout")
-def logout(request: Request):
-    refresh_token = request.cookies.get(settings.AUTH_REFRESH_COOKIE_NAME)
+def logout(request: Request, db: Session = Depends(get_db)):
+    refresh_token = request.cookies.get(settings.REFRESH_COOKIE_NAME)
     if refresh_token:
         try:
-            httpx.post(
-                settings.auth_logout_url,
-                json={"refresh_token": refresh_token},
-                timeout=5.0,
-            )
-        except httpx.HTTPError:
+            claims = decode_token(refresh_token, expected_use="refresh")
+            jti = str(claims.get("jti"))
+            stored = db.query(RefreshToken).filter(RefreshToken.jti == jti).first()
+            if stored is not None and not stored.revoked:
+                stored.revoked = True
+                db.commit()
+        except HTTPException:
             pass
+
     response = _auth_json({"message": "Logged out successfully"})
     _clear_session_cookies(response)
     return response
-
-
-@router.post("/login")
-def legacy_login(payload: UserLogin, db: Session = Depends(get_db)):
-    if not settings.LEGACY_AUTH_ENABLED:
-        raise HTTPException(
-            status_code=status.HTTP_410_GONE,
-            detail="Tutor local login is disabled; use central !thute Auth",
-        )
-
-    user = db.query(User).filter(User.email == payload.email).first()
-    if user is None or not user.password or not verify_password(payload.password, str(user.password)):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    return {
-        "access_token": authenticate_user(user),
-        "token_type": "bearer",
-        "user": {
-            "id": str(user.id),
-            "channel": user.channel,
-            "email": user.email,
-            "name": user.username,
-            "role": user.role,
-            "school_id": str(user.school_id) if user.school_id else None,
-        },
-    }
 
 
 @router.get("/users", response_model=list[UserRead])
@@ -447,12 +291,21 @@ def update_user(
 
     update_data = payload.model_dump(exclude_unset=True)
     if "password" in update_data:
-        if not settings.LEGACY_AUTH_ENABLED:
-            raise HTTPException(status_code=400, detail="local Tutor passwords are migration-only")
-        update_data["password"] = hash_password(update_data["password"])
+        password = str(update_data["password"] or "")
+        if len(password) < 8:
+            raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+        update_data["password"] = hash_password(password)
 
-    if "email" in update_data and user.auth_user_id is not None and update_data["email"] != user.email:
-        raise HTTPException(status_code=400, detail="central account email is managed by !thute Auth")
+    if "email" in update_data:
+        normalized_email = str(update_data["email"]).strip().lower()
+        duplicate = (
+            db.query(User)
+            .filter(User.email == normalized_email, User.id != user.id)
+            .first()
+        )
+        if duplicate is not None:
+            raise HTTPException(status_code=409, detail="Email is already in use")
+        update_data["email"] = normalized_email
 
     for key, value in update_data.items():
         setattr(user, key, value)

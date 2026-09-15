@@ -7,8 +7,8 @@ export type AuthStatus = "idle" | "checking" | "authenticated" | "anonymous" | "
 
 interface AuthState {
     user: UserAuthResponse | null;
-    // Access tokens may be held in memory after a refresh, but the central
-    // refresh token remains HttpOnly and is never stored in Redux/localStorage.
+    // Access tokens may be held in memory after refresh; Tutor's refresh token
+    // remains HttpOnly and is never stored in Redux or localStorage.
     token: string | null;
     status: AuthStatus;
     loading: boolean;
@@ -61,7 +61,8 @@ const authSlice = createSlice({
                     state.token = null;
                     state.status = "anonymous";
                 } else {
-                    // Do not turn a central-Auth/network outage into a logout.
+                    // A temporary Tutor API/database problem must not be presented
+                    // as an explicit logout when the session state is unknown.
                     state.status = "unavailable";
                 }
             })

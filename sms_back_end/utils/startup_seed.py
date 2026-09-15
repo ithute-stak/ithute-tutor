@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import os
-import secrets
-import uuid
 
 from sqlalchemy.orm import Session
 
@@ -13,41 +11,39 @@ from utils.auth.password_hash_verify import hash_password
 
 
 def seed_super_admin(db: Session):
-    """Optionally bootstrap a super admin by explicit central Auth subject.
+    """Optionally create Tutor's first local super administrator.
 
-    No fixed local credential is created. The random legacy password is never
-    printed or persisted outside the hash and therefore cannot be used to log in.
+    This bootstrap belongs only to Tutor. It does not create or link an account
+    in any other Ithute product.
     """
-    raw_subject = os.getenv("TUTOR_BOOTSTRAP_AUTH_USER_ID", "").strip()
-    if not raw_subject:
+    email = os.getenv("TUTOR_BOOTSTRAP_ADMIN_EMAIL", "").strip().lower()
+    if not email:
         return
 
-    try:
-        auth_user_id = uuid.UUID(raw_subject)
-    except ValueError as exc:
-        raise RuntimeError("TUTOR_BOOTSTRAP_AUTH_USER_ID must be a UUID") from exc
-
-    existing = db.query(User).filter(User.auth_user_id == auth_user_id).first()
+    existing = db.query(User).filter(User.email == email).first()
     if existing:
         if existing.role != UserRole.super_admin:
             existing.role = UserRole.super_admin
+        # Do not overwrite an existing password on every application restart.
         return
 
-    email = os.getenv("TUTOR_BOOTSTRAP_ADMIN_EMAIL", "").strip()
-    if not email:
-        raise RuntimeError("TUTOR_BOOTSTRAP_ADMIN_EMAIL is required with TUTOR_BOOTSTRAP_AUTH_USER_ID")
+    password = os.getenv("TUTOR_BOOTSTRAP_ADMIN_PASSWORD", "")
+    if len(password) < 12:
+        raise RuntimeError(
+            "TUTOR_BOOTSTRAP_ADMIN_PASSWORD must be at least 12 characters when bootstrapping an admin"
+        )
 
     user = User(
-        auth_user_id=auth_user_id,
         username=os.getenv("TUTOR_BOOTSTRAP_ADMIN_USERNAME", "superadmin").strip() or "superadmin",
         email=email,
-        password=hash_password(secrets.token_urlsafe(48)),
+        password=hash_password(password),
+        channel="system",
         role=UserRole.super_admin,
         school_id=None,
     )
     db.add(user)
     db.flush()
-    print("Tutor central-auth super admin profile created")
+    print("Tutor local super admin created")
 
 
 def seed_grades_and_classes(db: Session):

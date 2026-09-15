@@ -1,36 +1,58 @@
 from __future__ import annotations
 
-from fastapi import Depends, Request
+import uuid
+
+from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
+from database.config.config import settings
+from database.multi_tenant_school_management.models import User
 from database.session import get_db
-from utils.central_auth import require_central_claims, resolve_tutor_user
+from utils.decode_encode_token import create_access_token, decode_token
+
+
+def request_access_token(request: Request) -> str | None:
+    authorization = request.headers.get("Authorization", "")
+    if authorization.startswith("Bearer "):
+        return authorization[7:].strip() or None
+    return request.cookies.get(settings.ACCESS_COOKIE_NAME)
+
+
+def decode_access_token(token: str) -> dict:
+    return decode_token(token, expected_use="access")
 
 
 def get_current_user(
     request: Request,
     db: Session = Depends(get_db),
-):
-    """Resolve a Tutor user from a central !thute Auth access token.
+) -> User:
+    token = request_access_token(request)
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing Tutor session",
+        )
 
-    The access token can be supplied as a Bearer token (mobile/API clients) or
-    through the HttpOnly Tutor access cookie issued by the OIDC callback.
+    claims = decode_access_token(token)
+    raw_user_id = claims.get("user_id")
+    try:
+        user_id = uuid.UUID(str(raw_user_id))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid Tutor session",
+        ) from exc
 
-    Central-auth request handling must remain completely independent of the
-    migration-only local JWT keypair. Production disables legacy Tutor auth, so
-    importing this module must never require local JWT key material.
-    """
-    claims = require_central_claims(request)
-    return resolve_tutor_user(db, claims)
+    user = db.get(User, user_id)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Tutor user no longer exists",
+        )
+
+    request.state.tutor_user_id = user.id
+    return user
 
 
-def authenticate_user(user):
-    """Issue a migration-only Tutor JWT when legacy auth is explicitly used.
-
-    Import the old signer only at the point where a legacy token is actually
-    requested. This keeps central !thute Auth production startup independent of
-    JWT_PRIVATE_KEY/JWT_PUBLIC_KEY and their development file-path fallbacks.
-    """
-    from utils.decode_encode_token import create_access_token
-
-    return create_access_token(data={"user_id": str(user.id), "role": str(user.role)})
+def authenticate_user(user: User) -> str:
+    return create_access_token({"user_id": str(user.id), "role": getattr(user.role, "value", str(user.role))})
