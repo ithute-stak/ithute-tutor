@@ -79,18 +79,22 @@ def _role_value(user: User) -> str:
     return getattr(user.role, "value", str(user.role))
 
 
+def _user_payload(user: User) -> dict[str, object]:
+    return {
+        "id": str(user.id),
+        "channel": user.channel,
+        "email": user.email,
+        "name": user.username,
+        "role": _role_value(user),
+        "school_id": str(user.school_id) if user.school_id else None,
+    }
+
+
 def _login_payload(user: User, access_token: str) -> dict[str, object]:
     return {
         "access_token": access_token,
         "token_type": "bearer",
-        "user": {
-            "id": str(user.id),
-            "channel": user.channel,
-            "email": user.email,
-            "name": user.username,
-            "role": _role_value(user),
-            "school_id": str(user.school_id) if user.school_id else None,
-        },
+        "user": _user_payload(user),
     }
 
 
@@ -143,9 +147,9 @@ def login(payload: UserLogin, db: Session = Depends(get_db)):
     return response
 
 
-@router.get("/me", response_model=UserRead)
+@router.get("/me")
 def me(current_user: User = Depends(get_current_user)):
-    return current_user
+    return _user_payload(current_user)
 
 
 @router.post("/refresh")
