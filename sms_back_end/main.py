@@ -1,6 +1,5 @@
 from contextlib import asynccontextmanager
 
-import httpx
 from fastapi import FastAPI, HTTPException
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.middleware import SlowAPIMiddleware
@@ -65,13 +64,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     lifespan=lifespan,
-    title="!thute Tutor API",
-    version="3.2.0",
+    title="Ithute Tutor API",
+    version="4.0.0",
     description=(
-        "Unified education, learning and multi-tenant school management API for !thute Tutor. "
-        "Identity is provided by central !thute Auth; each active school workspace isolates its "
-        "operational records while approved learning resources, longitudinal learner mastery and "
-        "transfer-authorized history move safely with the learner."
+        "Standalone multi-tenant school management and learning API for Ithute Tutor. "
+        "Tutor owns its database, user identities, sessions and in-app notifications."
     ),
 )
 
@@ -97,7 +94,7 @@ app.add_middleware(SlowAPIMiddleware)
 
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok", "service": "ithute-tutor", "version": "3.2.0"}
+    return {"status": "ok", "service": "ithute-tutor", "version": "4.0.0"}
 
 
 @app.get("/readyz")
@@ -105,32 +102,19 @@ def readyz():
     try:
         with engine.connect() as connection:
             connection.execute(text("SELECT 1"))
-        response = httpx.get(settings.auth_jwks_url, timeout=3.0)
-        response.raise_for_status()
-        payload = response.json()
-        if not isinstance(payload.get("keys"), list) or not payload["keys"]:
-            raise RuntimeError("central Auth JWKS is empty")
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Tutor dependency not ready: {exc}") from exc
-    return {"status": "ready", "service": "ithute-tutor", "database": "ok", "auth": "ok"}
+        raise HTTPException(status_code=503, detail=f"Tutor database not ready: {exc}") from exc
+    return {"status": "ready", "service": "ithute-tutor", "database": "ok"}
 
 
 @app.get("/health/dependencies")
 def dependency_health():
-    result = {"auth": "unknown", "push": "unknown"}
     try:
-        auth_response = httpx.get(settings.auth_jwks_url, timeout=3.0)
-        auth_response.raise_for_status()
-        result["auth"] = "ok"
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
     except Exception:
-        result["auth"] = "unavailable"
-    try:
-        push_response = httpx.get(f"{settings.PUSH_BASE_URL.rstrip('/')}/readyz", timeout=3.0)
-        push_response.raise_for_status()
-        result["push"] = "ok"
-    except Exception:
-        result["push"] = "unavailable"
-    return result
+        return {"database": "unavailable"}
+    return {"database": "ok"}
 
 
 app.include_router(onboarding.router)
